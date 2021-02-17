@@ -1,0 +1,173 @@
+#!/usr/bin/perl -w
+
+use strict;
+use warnings;
+
+use Digest::SHA;
+use File::Basename qw/dirname/;
+use File::Copy qw/move/;
+use File::Find;
+use File::Path qw/make_path/;
+use LWP::UserAgent;
+use PerlIO::gzip;
+use XML::SimpleObject;
+
+package CloneRPM::UserAgent;
+
+use base "LWP::UserAgent";
+
+sub filename {
+	my ($self, $filename) = @_;
+
+	if(defined($filename)) {
+		$self->{filename} = $filename;
+	}
+	return $self->{filename};
+}
+
+sub progress {
+	my ($self, $status, $obj) = @_;
+	return if($status eq "tick");
+	if($status eq "begin") {
+		print $self->filename . ": 0%\r";
+		return;
+	}
+	if($status eq "end") {
+		print $self->{filename} . ": 100%\n";
+		return;
+	}
+	$status = int($status * 100);
+	print $self->{filename} . ": $status%\r";
+}
+
+package main;
+
+my $ua = CloneRPM::UserAgent->new;
+$ua->env_proxy;
+$ua->show_progress(1);
+
+my $baseurl = shift;
+my $basedir = shift;
+
+{
+	local $/ = '/';
+	chomp $basedir;
+	chomp $baseurl;
+}
+
+my $repomd_tmp = "repodata/repomd.xml.$$";
+
+my %touched = ( $basedir => 1 );
+
+sub keep_file {
+	my $file = shift;
+	if($file eq $basedir) {
+		return;
+	}
+	$touched{$file} = 1;
+	keep_file(dirname($file));
+}
+
+sub mirror_file {
+	my %opts = @_;
+	if(!exists($opts{target})) {
+		$opts{target} = $opts{relname};
+	}
+	my $absolute_target = join('/', $basedir, $opts{target});
+	my $absolute_url = join('/', $baseurl, $opts{relname});
+	my $keep_file = "$basedir/" . $opts{relname};
+	keep_file($keep_file);
+	make_path(dirname($absolute_target));
+	if(-f $absolute_target) {
+		if(exists($opts{checksum}) && exists($opts{check_alg})) {
+			my $check = Digest::SHA->new($opts{check_alg});
+			$check->addfile($absolute_target);
+			if($check->hexdigest eq $opts{checksum}) {
+				return;
+			} else {
+				print "File $absolute_target exists but does not match checksum. Redownloading...\n";
+			}
+		} elsif(exists($opts{checksum}) || exists($opts{check_alg})) {
+			# Should not happen.
+			die "Invalid call of mirror_file: have checksum but not algorithm, or vice versa.";
+		}
+		unlink($absolute_target);
+	}
+	$ua->filename($opts{relname});
+	my $response = $ua->mirror($absolute_url, $absolute_target);
+	if(!$response->is_success && !exists($opts{optional})) {
+		die "Could not download $absolute_url: $!\n";
+	}
+}
+
+mirror_file(relname => "repodata/repomd.xml", target => $repomd_tmp);
+mirror_file(relname => "repodata/repomd.xml.asc", target => "$repomd_tmp.asc", optional => 1);
+mirror_file(relname => "repodata/repomd.xml.key", target => "$repomd_tmp.key", optional => 1);
+
+my $repomd_xml;
+
+{
+	local $/ = undef;
+	open my $rmdfile, "<:encoding(UTF-8)", "$basedir/$repomd_tmp";
+	$repomd_xml = <$rmdfile>;
+	close $rmdfile;
+}
+
+my $primary;
+my $delta;
+my $xmlobj = XML::SimpleObject->new(XML => $repomd_xml);
+my @objs = $xmlobj->child('repomd')->children('data');
+foreach my $obj(@objs) {
+	mirror_file(relname => $obj->child('location')->attribute('href'), checksum => $obj->child('checksum')->value, check_alg => $obj->child('checksum')->attribute('type'));
+	if($obj->attribute('type') eq 'primary') {
+		$primary = $obj->child('location')->attribute('href');
+	} elsif($obj->attribute('type') eq 'deltainfo') {
+		$delta = $obj->child('location')->attribute('href');
+	}
+}
+
+my $primary_xml;
+
+{
+	local $/ = undef;
+	open my $primfile, "<:gzip:encoding(UTF-8)", "$basedir/$primary";
+	$primary_xml = <$primfile>;
+	close $primfile;
+}
+
+$xmlobj = XML::SimpleObject->new(XML => $primary_xml);
+@objs = $xmlobj->child('metadata')->children('package');
+foreach my $obj(@objs) {
+	mirror_file(relname => $obj->child('location')->attribute('href'), checksum => $obj->child('checksum')->value, check_alg => $obj->child('checksum')->attribute('type'));
+}
+
+if(defined($delta)) {
+	my $delta_xml;
+	{
+		local $/ = undef;
+		open my $dfile, "<:gzip:encoding(UTF-8)", "$basedir/$delta";
+		$delta_xml = <$dfile>;
+		close $dfile;
+	}
+	$xmlobj = XML::SimpleObject->new(XML => $delta_xml);
+	@objs = $xmlobj->child('deltainfo')->children('newpackage');
+	foreach my $obj(@objs) {
+		mirror_file(relname => $obj->child('filename')->value, checksum => $obj->child('checksum')->value, check_alg => $obj->child('checksum')->attribute('type'));
+	}
+}
+
+move("$basedir/$repomd_tmp", "$basedir/repodata/repomd.xml");
+if(-f "$basedir/$repomd_tmp.asc") {
+	move("$basedir/$repomd_tmp.asc", "$basedir/repomd.xml.asc");
+	move("$basedir/$repomd_tmp.key", "$basedir/repomd.xml.key");
+}
+
+finddepth(sub {
+	if(!exists($touched{$File::Find::name})) {
+		if(-d $File::Find::name) {
+			rmdir($File::Find::name);
+		} else {
+			unlink($File::Find::name);
+		}
+	}
+}, $basedir);
