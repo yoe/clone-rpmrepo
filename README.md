@@ -18,8 +18,8 @@ doing so, it uses the following algorithm:
 - Move the temporary `repomd.xml` file as well as the `.key` and `.asc`
   files (if they exist) to the original name.
 - Finally, go over all the files in the local directory, removing any
-  files that were not referenced from any of the XML files downloaded
-  previously.
+  files and directories that were not referenced from any of the XML files
+  downloaded previously.
 
 This keeps the repository internally consistent while the files are
 being downloaded, and removes all files that are no longer needed.
