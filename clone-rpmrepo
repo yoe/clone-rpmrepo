@@ -1,5 +1,8 @@
 #!/usr/bin/perl -w
 
+# Copyright(c) Wouter Verhelst, 2021
+# License: GPLv2 or above.
+
 use strict;
 use warnings;
 
